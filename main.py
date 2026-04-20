@@ -1,26 +1,45 @@
 """Bot immobilier — scanner des maisons en Val-de-Marne en temps réel."""
 
-import logging
-import signal
 import sys
-import time
-from datetime import datetime
+import traceback
 
-# Logging en premier
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    stream=sys.stdout,
-)
-logger = logging.getLogger("immo-bot")
+print("=== IMMO-BOT STARTING ===", flush=True)
 
-# Imports applicatifs
-from config import CONFIG, CITIES, FILTERS
-from database import ListingDB
-from notifier import notify
-from scrapers import ALL_SCRAPERS
-from server import start_health_server
+try:
+    import logging
+    import signal
+    import time
+    from datetime import datetime
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        stream=sys.stdout,
+    )
+    logger = logging.getLogger("immo-bot")
+
+    print("Imports standard OK", flush=True)
+
+    from config import CONFIG, CITIES, FILTERS
+    print("Config OK", flush=True)
+
+    from database import ListingDB
+    print("Database OK", flush=True)
+
+    from notifier import notify
+    print("Notifier OK", flush=True)
+
+    from scrapers import ALL_SCRAPERS
+    print(f"Scrapers OK: {[s.name for s in ALL_SCRAPERS]}", flush=True)
+
+    from server import start_health_server
+    print("Server OK", flush=True)
+
+except Exception as exc:
+    print(f"IMPORT ERROR: {exc}", flush=True)
+    traceback.print_exc()
+    sys.exit(1)
 
 # Arrêt propre
 running = True
@@ -28,32 +47,12 @@ running = True
 
 def signal_handler(signum, frame):
     global running
-    logger.info("Signal %s reçu — arrêt en cours...", signum)
+    logger.info("Signal %s reçu — arrêt...", signum)
     running = False
 
 
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
-
-
-def print_config() -> None:
-    notif_channels = []
-    if CONFIG.has_free_mobile:
-        notif_channels.append("Free Mobile SMS")
-    if CONFIG.has_twilio:
-        notif_channels.append("Twilio SMS")
-    if CONFIG.has_telegram:
-        notif_channels.append("Telegram")
-    if not notif_channels:
-        notif_channels.append("AUCUN")
-
-    scrapers_str = ", ".join(s.name for s in ALL_SCRAPERS)
-    logger.info("=" * 50)
-    logger.info("  IMMO-BOT Val-de-Marne")
-    logger.info("  Prix max: %d EUR | Surface min: %dm2", FILTERS.price_max, FILTERS.surface_min)
-    logger.info("  Scan: toutes les %ds | Notifs: %s", CONFIG.scan_interval, " + ".join(notif_channels))
-    logger.info("  Scrapers: %s", scrapers_str)
-    logger.info("=" * 50)
 
 
 def run_scan(db: ListingDB) -> int:
@@ -83,13 +82,13 @@ def run_scan(db: ListingDB) -> int:
 
 
 def main() -> None:
-    logger.info("Demarrage immo-bot...")
-
-    # Serveur HTTP pour Render health check
+    # Health check HTTP pour Render
     start_health_server()
-    logger.info("Health server OK")
+    logger.info("Health server demarré")
 
-    print_config()
+    scrapers_str = ", ".join(s.name for s in ALL_SCRAPERS)
+    logger.info("IMMO-BOT | %d EUR max | %dm2 min | Scrapers: %s", FILTERS.price_max, FILTERS.surface_min, scrapers_str)
+    logger.info("Telegram: %s", "actif" if CONFIG.has_telegram else "inactif")
 
     db = ListingDB(CONFIG.db_path)
     scan_number = 0
@@ -121,4 +120,9 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        print(f"FATAL ERROR: {exc}", flush=True)
+        traceback.print_exc()
+        sys.exit(1)
