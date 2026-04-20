@@ -1,8 +1,4 @@
-"""Bot immobilier — scanner des maisons en Val-de-Marne en temps réel.
-
-Scanne LeBonCoin, Bien'ici, PAP et SeLoger toutes les 3 minutes.
-Envoie une notification SMS/Telegram pour chaque nouvelle annonce.
-"""
+"""Bot immobilier — scanner des maisons en Val-de-Marne en temps réel."""
 
 import logging
 import signal
@@ -10,22 +6,21 @@ import sys
 import time
 from datetime import datetime
 
+# Logging en premier
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    stream=sys.stdout,
+)
+logger = logging.getLogger("immo-bot")
+
+# Imports applicatifs
 from config import CONFIG, CITIES, FILTERS
 from database import ListingDB
 from notifier import notify
 from scrapers import ALL_SCRAPERS
 from server import start_health_server
-
-# Logging
-logging.basicConfig(
-    level=getattr(logging, CONFIG.log_level),
-    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-    ],
-)
-logger = logging.getLogger("immo-bot")
 
 # Arrêt propre
 running = True
@@ -42,7 +37,6 @@ signal.signal(signal.SIGTERM, signal_handler)
 
 
 def print_config() -> None:
-    cities_str = ", ".join(f"{c.name} ({c.zipcode})" for c in CITIES)
     notif_channels = []
     if CONFIG.has_free_mobile:
         notif_channels.append("Free Mobile SMS")
@@ -51,25 +45,19 @@ def print_config() -> None:
     if CONFIG.has_telegram:
         notif_channels.append("Telegram")
     if not notif_channels:
-        notif_channels.append("AUCUN (configurez .env)")
+        notif_channels.append("AUCUN")
 
-    logger.info("=" * 60)
-    logger.info("  IMMO-BOT — Scanner immobilier Val-de-Marne")
-    logger.info("=" * 60)
-    logger.info("  Villes    : %s", cities_str)
-    logger.info("  Type      : %s", FILTERS.property_type)
-    logger.info("  Prix max  : %s€", f"{FILTERS.price_max:,}")
-    logger.info("  Surface   : >= %dm²", FILTERS.surface_min)
-    logger.info("  Scan      : toutes les %ds (%dmin)", CONFIG.scan_interval, CONFIG.scan_interval // 60)
-    logger.info("  Notifs    : %s", " + ".join(notif_channels))
-    logger.info("  Sites     : LeBonCoin, Bien'ici, PAP, SeLoger")
-    logger.info("=" * 60)
+    scrapers_str = ", ".join(s.name for s in ALL_SCRAPERS)
+    logger.info("=" * 50)
+    logger.info("  IMMO-BOT Val-de-Marne")
+    logger.info("  Prix max: %d EUR | Surface min: %dm2", FILTERS.price_max, FILTERS.surface_min)
+    logger.info("  Scan: toutes les %ds | Notifs: %s", CONFIG.scan_interval, " + ".join(notif_channels))
+    logger.info("  Scrapers: %s", scrapers_str)
+    logger.info("=" * 50)
 
 
 def run_scan(db: ListingDB) -> int:
-    """Lance un scan sur tous les sites. Retourne le nombre de nouvelles annonces."""
     new_count = 0
-
     for scraper_class in ALL_SCRAPERS:
         scraper = scraper_class()
         try:
@@ -78,26 +66,29 @@ def run_scan(db: ListingDB) -> int:
                 if db.insert(listing):
                     new_count += 1
                     logger.info(
-                        "NOUVELLE: [%s] %s — %s€ — %dm² — %s (%s)",
-                        listing.source,
-                        listing.title[:50],
-                        f"{listing.price:,}",
-                        listing.surface,
-                        listing.city,
-                        listing.url,
+                        "NOUVELLE: [%s] %s — %d EUR — %dm2 — %s",
+                        listing.source, listing.title[:50],
+                        listing.price, listing.surface, listing.city,
                     )
-                    if notify(listing):
+                    try:
+                        notify(listing)
                         db.mark_notified(listing.source, listing.source_id)
+                    except Exception as exc:
+                        logger.error("Notification erreur: %s", exc)
         except Exception as exc:
             logger.error("Erreur scraper %s: %s", scraper.name, exc)
         finally:
             scraper.close()
-
     return new_count
 
 
 def main() -> None:
+    logger.info("Demarrage immo-bot...")
+
+    # Serveur HTTP pour Render health check
     start_health_server()
+    logger.info("Health server OK")
+
     print_config()
 
     db = ListingDB(CONFIG.db_path)
@@ -106,37 +97,27 @@ def main() -> None:
     try:
         while running:
             scan_number += 1
-            start = time.monotonic()
-            logger.info("--- Scan #%d à %s ---", scan_number, datetime.now().strftime("%H:%M:%S"))
+            logger.info("--- Scan #%d ---", scan_number)
 
-            new_count = run_scan(db)
-            elapsed = time.monotonic() - start
+            try:
+                new_count = run_scan(db)
+                stats = db.stats()
+                total = sum(stats.values()) if stats else 0
+                logger.info("Scan #%d: %d nouvelles, %d total", scan_number, new_count, total)
+            except Exception as exc:
+                logger.error("Scan #%d erreur: %s", scan_number, exc)
 
-            stats = db.stats()
-            total = sum(stats.values())
-            logger.info(
-                "Scan #%d terminé en %.1fs — %d nouvelles, %d total (%s)",
-                scan_number,
-                elapsed,
-                new_count,
-                total,
-                ", ".join(f"{k}: {v}" for k, v in stats.items()),
-            )
-
-            # Attendre avant le prochain scan
             if running:
-                logger.info("Prochain scan dans %ds...", CONFIG.scan_interval)
-                # Dormir par tranches de 1s pour réagir vite au signal d'arrêt
                 for _ in range(CONFIG.scan_interval):
                     if not running:
                         break
                     time.sleep(1)
 
     except KeyboardInterrupt:
-        logger.info("Interruption clavier")
+        pass
     finally:
         db.close()
-        logger.info("Bot arrêté proprement.")
+        logger.info("Bot arrete.")
 
 
 if __name__ == "__main__":

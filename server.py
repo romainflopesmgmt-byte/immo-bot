@@ -4,8 +4,6 @@ import os
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-from database import ListingDB
-
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
