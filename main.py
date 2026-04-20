@@ -23,7 +23,6 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler("immo-bot.log", encoding="utf-8"),
     ],
 )
 logger = logging.getLogger("immo-bot")

@@ -7,7 +7,12 @@ import re
 from config import CITIES, FILTERS
 from database import Listing
 from scrapers.base import BaseScraper
-from scrapers.browser import browser_context
+
+try:
+    from scrapers.browser import browser_context
+    HAS_PLAYWRIGHT = True
+except ImportError:
+    HAS_PLAYWRIGHT = False
 
 logger = logging.getLogger(__name__)
 
@@ -100,7 +105,11 @@ class LeBonCoinScraper(BaseScraper):
             return results
 
         # Tentative 2 : Playwright (fiable si API rate-limitée)
-        return self._scrape_playwright()
+        if HAS_PLAYWRIGHT:
+            return self._scrape_playwright()
+
+        logger.warning("LeBonCoin API bloquée et Playwright non disponible")
+        return results
 
     def _scrape_api(self) -> list[Listing]:
         results: list[Listing] = []
