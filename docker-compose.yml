@@ -1,0 +1,11 @@
+services:
+  immo-bot:
+    build: .
+    restart: always
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+      - ./immo-bot.log:/app/immo-bot.log
+    environment:
+      - DB_PATH=/app/data/listings.db
+      - TZ=Europe/Paris
