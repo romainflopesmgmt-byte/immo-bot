@@ -24,6 +24,8 @@ CITIES: list[City] = [
     City("Le Perreux-sur-Marne", "94170"),
     City("Nogent-sur-Marne", "94130"),
     City("Le Plessis-Trévise", "94420"),
+    City("Ormesson-sur-Marne", "94490"),
+    City("Champigny-sur-Marne", "94500"),
 ]
 
 
