@@ -1,26 +1,22 @@
-"""Scraper LeBonCoin — API interne + fallback Playwright."""
+"""Scraper LeBonCoin — API interne avec session cookies."""
 
 import json
 import logging
+import random
 import re
+import time
+
+import httpx
 
 from config import CITIES, FILTERS
 from database import Listing
-from scrapers.base import BaseScraper
-
-try:
-    from scrapers.browser import browser_context
-    HAS_PLAYWRIGHT = True
-except ImportError:
-    HAS_PLAYWRIGHT = False
+from scrapers.base import BaseScraper, USER_AGENTS
 
 logger = logging.getLogger(__name__)
 
 LEBONCOIN_API = "https://api.leboncoin.fr/finder/search"
 CATEGORY_MAP = {"buy": "9", "rent": "10"}
 PROPERTY_TYPE_MAP = {"house": ["1"], "apartment": ["2"], "both": ["1", "2"]}
-
-TARGET_ZIPCODES = {c.zipcode for c in CITIES}
 
 
 class LeBonCoinScraper(BaseScraper):
@@ -99,19 +95,99 @@ class LeBonCoinScraper(BaseScraper):
     def scrape(self) -> list[Listing]:
         logger.info("LeBonCoin — lancement du scan...")
 
-        # Tentative 1 : API directe (rapide)
-        results = self._scrape_api()
+        # Tentative 1 : API avec session cookies
+        results = self._scrape_with_session()
         if results:
             return results
 
-        # Tentative 2 : Playwright (fiable si API rate-limitée)
-        if HAS_PLAYWRIGHT:
-            return self._scrape_playwright()
+        # Tentative 2 : API directe (fallback)
+        results = self._scrape_api_direct()
+        if results:
+            return results
 
-        logger.warning("LeBonCoin API bloquée et Playwright non disponible")
+        logger.warning("LeBonCoin — aucune méthode n'a fonctionné")
+        return []
+
+    def _scrape_with_session(self) -> list[Listing]:
+        """Etablit une session en visitant LeBonCoin d'abord, puis appelle l'API."""
+        results: list[Listing] = []
+        ua = random.choice(USER_AGENTS)
+
+        try:
+            # Créer un client avec cookies persistants
+            session = httpx.Client(
+                timeout=30,
+                follow_redirects=True,
+                http2=False,
+            )
+
+            # Etape 1 : visiter la page d'accueil pour obtenir les cookies
+            home_headers = {
+                "User-Agent": ua,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Connection": "keep-alive",
+                "Upgrade-Insecure-Requests": "1",
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "none",
+                "Sec-Fetch-User": "?1",
+                "Cache-Control": "max-age=0",
+            }
+
+            logger.info("LeBonCoin — établissement de la session...")
+            home_resp = session.get("https://www.leboncoin.fr/", headers=home_headers)
+            logger.info("LeBonCoin — page d'accueil HTTP %s, cookies: %d",
+                        home_resp.status_code, len(session.cookies))
+
+            time.sleep(random.uniform(1.5, 3.0))
+
+            # Etape 2 : appeler l'API avec les cookies de session
+            api_headers = {
+                "User-Agent": ua,
+                "Accept": "application/json, text/plain, */*",
+                "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Content-Type": "application/json",
+                "api_key": "ba0c2dad52b3ec",
+                "Origin": "https://www.leboncoin.fr",
+                "Referer": "https://www.leboncoin.fr/recherche?category=9&real_estate_type=house",
+                "Sec-Fetch-Dest": "empty",
+                "Sec-Fetch-Mode": "cors",
+                "Sec-Fetch-Site": "same-site",
+                "Connection": "keep-alive",
+            }
+
+            resp = session.post(
+                LEBONCOIN_API,
+                json=self._build_payload(),
+                headers=api_headers,
+            )
+
+            session.close()
+
+            if resp.status_code != 200:
+                logger.warning("LeBonCoin session API HTTP %s", resp.status_code)
+                return results
+
+            data = resp.json()
+            ads = data.get("ads", [])
+            logger.info("LeBonCoin session — %d annonces trouvées", len(ads))
+
+            for ad in ads:
+                listing = self._parse_ad(ad)
+                if listing and self._matches_filters(listing):
+                    results.append(listing)
+
+        except Exception as exc:
+            logger.warning("LeBonCoin session erreur: %s", exc)
+
+        self._throttle()
         return results
 
-    def _scrape_api(self) -> list[Listing]:
+    def _scrape_api_direct(self) -> list[Listing]:
+        """Appel API direct sans session (méthode originale)."""
         results: list[Listing] = []
         try:
             headers = {
@@ -129,12 +205,12 @@ class LeBonCoinScraper(BaseScraper):
             )
 
             if resp.status_code != 200:
-                logger.warning("LeBonCoin API HTTP %s — passage au fallback", resp.status_code)
+                logger.warning("LeBonCoin API directe HTTP %s", resp.status_code)
                 return results
 
             data = resp.json()
             ads = data.get("ads", [])
-            logger.info("LeBonCoin API — %d annonces trouvées", len(ads))
+            logger.info("LeBonCoin API directe — %d annonces", len(ads))
 
             for ad in ads:
                 listing = self._parse_ad(ad)
@@ -142,136 +218,7 @@ class LeBonCoinScraper(BaseScraper):
                     results.append(listing)
 
         except Exception as exc:
-            logger.warning("LeBonCoin API erreur: %s", exc)
+            logger.warning("LeBonCoin API directe erreur: %s", exc)
 
         self._throttle()
-        return results
-
-    def _scrape_playwright(self) -> list[Listing]:
-        """Fallback Playwright quand l'API est bloquée."""
-        logger.info("LeBonCoin — fallback Playwright...")
-        results: list[Listing] = []
-
-        # Construire l'URL de recherche avec les villes
-        cities_param = "%2C".join(c.zipcode for c in CITIES)
-        url = (
-            "https://www.leboncoin.fr/recherche?category=9"
-            "&real_estate_type=house"
-            f"&price=0-{FILTERS.price_max}"
-            f"&square={FILTERS.surface_min}-all"
-            "&sort=time"
-            "&owner_type=all"
-        )
-
-        try:
-            with browser_context() as ctx:
-                page = ctx.new_page()
-                page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                page.wait_for_timeout(4000)
-
-                # Accepter cookies
-                try:
-                    cookie_btn = page.query_selector(
-                        "#didomi-notice-agree-button, "
-                        "button[id*='accept']"
-                    )
-                    if cookie_btn and cookie_btn.is_visible():
-                        cookie_btn.click()
-                        page.wait_for_timeout(1000)
-                except Exception:
-                    pass
-
-                # Extraire __NEXT_DATA__ si disponible
-                next_data_el = page.query_selector("script#__NEXT_DATA__")
-                if next_data_el:
-                    json_text = next_data_el.inner_text()
-                    next_data = json.loads(json_text)
-                    ads = (
-                        next_data.get("props", {})
-                        .get("pageProps", {})
-                        .get("searchData", {})
-                        .get("ads", [])
-                    )
-                    logger.info("LeBonCoin Playwright __NEXT_DATA__ — %d annonces", len(ads))
-                    for ad in ads:
-                        listing = self._parse_ad(ad)
-                        if listing and self._matches_filters(listing):
-                            results.append(listing)
-                else:
-                    # Parse les cartes visuellement
-                    results = self._parse_cards_playwright(page)
-
-                page.close()
-
-        except Exception as exc:
-            logger.error("LeBonCoin Playwright erreur: %s", exc)
-
-        logger.info("LeBonCoin Playwright — %d annonces filtrées", len(results))
-        return results
-
-    def _parse_cards_playwright(self, page) -> list[Listing]:
-        """Parse les cartes d'annonces quand __NEXT_DATA__ n'est pas dispo."""
-        results: list[Listing] = []
-
-        links = page.query_selector_all("a[href*='/ad/ventes_immobilieres/']")
-        logger.info("LeBonCoin Playwright — %d liens d'annonces", len(links))
-
-        seen_ids: set[str] = set()
-        for link in links:
-            try:
-                href = link.get_attribute("href") or ""
-                ad_id_match = re.search(r"/ad/ventes_immobilieres/(\d+)", href)
-                if not ad_id_match:
-                    continue
-                ad_id = ad_id_match.group(1)
-                if ad_id in seen_ids:
-                    continue
-                seen_ids.add(ad_id)
-
-                parent = link.evaluate_handle(
-                    "el => el.closest('[data-testid]') || el.closest('article') || el.parentElement.parentElement"
-                ).as_element()
-                text = parent.inner_text() if parent else link.inner_text()
-
-                # Prix
-                price_match = re.search(r"([\d\s\.\xa0]+)\s*€", text)
-                price = 0
-                if price_match:
-                    price_str = price_match.group(1).replace(".", "").replace(" ", "").replace("\xa0", "")
-                    price = int(price_str) if price_str.isdigit() else 0
-
-                # Surface
-                surface_match = re.search(r"(\d+)\s*m[²2]", text)
-                surface = int(surface_match.group(1)) if surface_match else 0
-
-                # Pièces
-                rooms_match = re.search(r"(\d+)\s*pi[eè]ce", text)
-                rooms = int(rooms_match.group(1)) if rooms_match else None
-
-                # Ville
-                city, zipcode = "", ""
-                for c in CITIES:
-                    if c.name.lower() in text.lower() or c.zipcode in text:
-                        city = c.name
-                        zipcode = c.zipcode
-                        break
-
-                if price > 0 and city:
-                    listing = Listing(
-                        source="leboncoin",
-                        source_id=ad_id,
-                        title=f"Maison {surface}m² {city}" if surface else f"Maison {city}",
-                        price=price,
-                        surface=surface,
-                        rooms=rooms,
-                        city=city,
-                        zipcode=zipcode,
-                        url=f"https://www.leboncoin.fr{href}" if not href.startswith("http") else href,
-                    )
-                    if self._matches_filters(listing):
-                        results.append(listing)
-
-            except Exception:
-                continue
-
         return results
