@@ -1,10 +1,16 @@
-"""Scraper LeBonCoin — curl_cffi (si dispo) ou httpx."""
+"""Scraper LeBonCoin — ScraperAPI (gratuit) pour bypass DataDome."""
 
 import json
 import logging
+import os
 import random
 import re
+import subprocess
 import time
+import urllib.parse
+
+import httpx
+from bs4 import BeautifulSoup
 
 from config import CITIES, FILTERS
 from database import Listing
@@ -12,15 +18,7 @@ from scrapers.base import BaseScraper, USER_AGENTS
 
 logger = logging.getLogger(__name__)
 
-# Import curl_cffi si disponible
-try:
-    from curl_cffi import requests as curl_requests
-    HAS_CURL_CFFI = True
-    logger.info("curl_cffi disponible — impersonation Chrome activée")
-except ImportError:
-    HAS_CURL_CFFI = False
-    logger.info("curl_cffi non disponible — httpx uniquement")
-
+SCRAPER_API_KEY = os.getenv("SCRAPER_API_KEY", "")
 LEBONCOIN_API = "https://api.leboncoin.fr/finder/search"
 CATEGORY_MAP = {"buy": "9", "rent": "10"}
 PROPERTY_TYPE_MAP = {"house": ["1"], "apartment": ["2"], "both": ["1", "2"]}
@@ -28,6 +26,19 @@ PROPERTY_TYPE_MAP = {"house": ["1"], "apartment": ["2"], "both": ["1", "2"]}
 
 class LeBonCoinScraper(BaseScraper):
     name = "leboncoin"
+
+    def _build_search_url(self) -> str:
+        """Construit l'URL de recherche LeBonCoin."""
+        params = {
+            "category": CATEGORY_MAP.get(FILTERS.transaction, "9"),
+            "real_estate_type": "house" if FILTERS.property_type == "house" else "flat",
+            "locations": "d_94",
+            "price": f"min-{FILTERS.price_min}-max-{FILTERS.price_max}" if FILTERS.price_min else f"max-{FILTERS.price_max}",
+            "square": f"min-{FILTERS.surface_min}",
+            "sort": "time",
+        }
+        qs = "&".join(f"{k}={v}" for k, v in params.items())
+        return f"https://www.leboncoin.fr/recherche?{qs}"
 
     def _build_payload(self) -> dict:
         locations = []
@@ -99,114 +110,173 @@ class LeBonCoinScraper(BaseScraper):
             logger.debug("LeBonCoin parse erreur: %s", exc)
             return None
 
+    def _parse_html_listing(self, card, idx: int) -> Listing | None:
+        """Parse une carte d'annonce depuis le HTML rendu."""
+        try:
+            text = card.get_text(" ", strip=True)
+
+            # Prix
+            price_match = re.search(r"([\d\s\.]+)\s*€", text)
+            price = 0
+            if price_match:
+                price_str = re.sub(r"[^\d]", "", price_match.group(1))
+                price = int(price_str) if price_str else 0
+
+            # Surface
+            surf_match = re.search(r"(\d+)\s*m[²2]", text)
+            surface = int(surf_match.group(1)) if surf_match else 0
+
+            # Pièces
+            rooms_match = re.search(r"(\d+)\s*(?:pi[èe]ce|p\.)", text)
+            rooms = int(rooms_match.group(1)) if rooms_match else None
+
+            # Lien
+            link = card.select_one("a[href*='/ad/']") or card.select_one("a[href*='/ventes']")
+            href = link.get("href", "") if link else ""
+            ad_id_match = re.search(r"/(\d+)(?:\?|$)", href)
+            ad_id = ad_id_match.group(1) if ad_id_match else str(idx)
+
+            full_url = f"https://www.leboncoin.fr{href}" if href and not href.startswith("http") else href
+
+            # Ville
+            city = ""
+            zipcode = ""
+            for c in CITIES:
+                if c.name.lower() in text.lower() or c.zipcode in text:
+                    city = c.name
+                    zipcode = c.zipcode
+                    break
+
+            if price == 0:
+                return None
+
+            return Listing(
+                source="leboncoin",
+                source_id=ad_id,
+                title=text[:80],
+                price=price,
+                surface=surface,
+                rooms=rooms,
+                city=city,
+                zipcode=zipcode,
+                url=full_url or f"https://www.leboncoin.fr/ad/ventes_immobilieres/{ad_id}",
+            )
+        except Exception as exc:
+            logger.debug("LeBonCoin HTML parse erreur: %s", exc)
+            return None
+
     def scrape(self) -> list[Listing]:
         logger.info("LeBonCoin — lancement du scan...")
 
-        if HAS_CURL_CFFI:
-            results = self._scrape_curl_cffi()
+        # Methode 1 : ScraperAPI (rendu navigateur = bypass DataDome)
+        if SCRAPER_API_KEY:
+            results = self._scrape_via_scraperapi()
             if results:
                 return results
-            logger.info("LeBonCoin curl_cffi — 0 résultats, essai httpx...")
 
-        results = self._scrape_api_direct()
+        # Methode 2 : curl direct API (peut etre bloque)
+        results = self._scrape_curl_api()
         if results:
             return results
 
-        logger.warning("LeBonCoin — aucune méthode n'a fonctionné")
+        if not SCRAPER_API_KEY:
+            logger.warning(
+                "LeBonCoin — bloqué par DataDome. "
+                "Ajoute SCRAPER_API_KEY (gratuit sur scraperapi.com) pour contourner."
+            )
         return []
 
-    def _scrape_curl_cffi(self) -> list[Listing]:
-        """curl_cffi imite le TLS fingerprint de Chrome."""
+    def _scrape_via_scraperapi(self) -> list[Listing]:
+        """Utilise ScraperAPI pour rendre la page de recherche LeBonCoin."""
         results: list[Listing] = []
         try:
-            session = curl_requests.Session(impersonate="chrome124")
-
-            logger.info("LeBonCoin curl_cffi — visite homepage...")
-            home_resp = session.get(
-                "https://www.leboncoin.fr/",
-                headers={
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                    "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
-                    "Sec-Fetch-Dest": "document",
-                    "Sec-Fetch-Mode": "navigate",
-                    "Sec-Fetch-Site": "none",
-                    "Sec-Fetch-User": "?1",
-                    "Upgrade-Insecure-Requests": "1",
-                },
+            search_url = self._build_search_url()
+            api_url = (
+                f"http://api.scraperapi.com"
+                f"?api_key={SCRAPER_API_KEY}"
+                f"&url={urllib.parse.quote(search_url)}"
+                f"&render=true"
+                f"&country_code=fr"
             )
-            logger.info("LeBonCoin curl_cffi — homepage HTTP %s, cookies: %d",
-                        home_resp.status_code, len(session.cookies))
 
-            time.sleep(random.uniform(2.0, 4.0))
+            logger.info("LeBonCoin ScraperAPI — fetch page de recherche...")
+            resp = httpx.get(api_url, timeout=60)
 
-            logger.info("LeBonCoin curl_cffi — appel API...")
-            api_resp = session.post(
-                LEBONCOIN_API,
-                json=self._build_payload(),
-                headers={
-                    "Accept": "application/json, text/plain, */*",
-                    "Accept-Language": "fr-FR,fr;q=0.9",
-                    "Content-Type": "application/json",
-                    "api_key": "ba0c2dad52b3ec",
-                    "Origin": "https://www.leboncoin.fr",
-                    "Referer": "https://www.leboncoin.fr/recherche",
-                    "Sec-Fetch-Dest": "empty",
-                    "Sec-Fetch-Mode": "cors",
-                    "Sec-Fetch-Site": "same-site",
-                },
-            )
-            session.close()
-
-            logger.info("LeBonCoin curl_cffi — API HTTP %s", api_resp.status_code)
-            if api_resp.status_code != 200:
+            if resp.status_code != 200:
+                logger.warning("LeBonCoin ScraperAPI HTTP %s", resp.status_code)
                 return results
 
-            data = api_resp.json()
-            ads = data.get("ads", [])
-            logger.info("LeBonCoin curl_cffi — %d annonces trouvées", len(ads))
+            soup = BeautifulSoup(resp.text, "html.parser")
 
-            for ad in ads:
-                listing = self._parse_ad(ad)
+            # LeBonCoin utilise des balises <a> avec data-test-id ou class contenant "ad"
+            cards = (
+                soup.select("[data-test-id*='ad']")
+                or soup.select("a[href*='/ad/']")
+                or soup.select("[class*='adCard']")
+                or soup.select("[class*='listing']")
+            )
+
+            logger.info("LeBonCoin ScraperAPI — %d cartes trouvées", len(cards))
+
+            for idx, card in enumerate(cards):
+                listing = self._parse_html_listing(card, idx)
                 if listing and self._matches_filters(listing):
                     results.append(listing)
 
+            logger.info("LeBonCoin ScraperAPI — %d annonces après filtres", len(results))
+
         except Exception as exc:
-            logger.warning("LeBonCoin curl_cffi erreur: %s", exc)
+            logger.warning("LeBonCoin ScraperAPI erreur: %s", exc)
 
         self._throttle()
         return results
 
-    def _scrape_api_direct(self) -> list[Listing]:
-        """Appel API direct httpx (fallback)."""
+    def _scrape_curl_api(self) -> list[Listing]:
+        """Appel API direct via curl (fonctionne si pas de captcha)."""
         results: list[Listing] = []
         try:
-            headers = {
-                **self._base_headers(),
-                "api_key": "ba0c2dad52b3ec",
-                "Content-Type": "application/json",
-                "Origin": "https://www.leboncoin.fr",
-                "Referer": "https://www.leboncoin.fr/",
-            }
-            resp = self.client.post(
-                LEBONCOIN_API,
-                json=self._build_payload(),
-                headers=headers,
+            payload = json.dumps(self._build_payload())
+            result = subprocess.run(
+                [
+                    "curl", "-sL", "-X", "POST",
+                    LEBONCOIN_API,
+                    "-H", f"User-Agent: {random.choice(USER_AGENTS)}",
+                    "-H", "Content-Type: application/json",
+                    "-H", "api_key: ba0c2dad52b3ec",
+                    "-H", "Origin: https://www.leboncoin.fr",
+                    "-H", "Referer: https://www.leboncoin.fr/",
+                    "-H", "Accept: application/json",
+                    "-d", payload,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
             )
-            if resp.status_code != 200:
-                logger.warning("LeBonCoin httpx HTTP %s", resp.status_code)
+
+            body = result.stdout.strip()
+            if not body:
+                logger.warning("LeBonCoin curl — réponse vide")
                 return results
 
-            data = resp.json()
+            data = json.loads(body)
+
+            # Detecter captcha DataDome
+            if "captcha-delivery" in data.get("url", ""):
+                logger.warning("LeBonCoin curl — CAPTCHA DataDome détecté")
+                return results
+
             ads = data.get("ads", [])
-            logger.info("LeBonCoin httpx — %d annonces", len(ads))
+            logger.info("LeBonCoin curl — %d annonces", len(ads))
 
             for ad in ads:
                 listing = self._parse_ad(ad)
                 if listing and self._matches_filters(listing):
                     results.append(listing)
 
+        except json.JSONDecodeError:
+            logger.warning("LeBonCoin curl — réponse non-JSON (probablement captcha)")
         except Exception as exc:
-            logger.warning("LeBonCoin httpx erreur: %s", exc)
+            logger.warning("LeBonCoin curl erreur: %s", exc)
 
         self._throttle()
         return results

@@ -2,14 +2,11 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Deps systeme pour curl_cffi
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libssl-dev \
-    && rm -rf /var/lib/apt/lists/*
+# curl pour les scrapers (TLS fingerprint normal)
+RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir httpx beautifulsoup4 python-dotenv && \
-    pip install --no-cache-dir curl_cffi || echo "WARN: curl_cffi failed, continuing without it"
+RUN pip install --no-cache-dir httpx beautifulsoup4 python-dotenv
 
 COPY . .
 
