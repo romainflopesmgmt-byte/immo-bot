@@ -3,7 +3,7 @@ FROM python:3.12-slim
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir httpx beautifulsoup4 python-dotenv
+RUN pip install --no-cache-dir httpx beautifulsoup4 python-dotenv curl_cffi
 
 COPY . .
 
