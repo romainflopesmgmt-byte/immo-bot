@@ -1,0 +1,47 @@
+name: LeBonCoin Scanner
+
+on:
+  schedule:
+    # Toutes les heures de 7h à 23h (heure Paris = UTC+2)
+    - cron: '0 5-21 * * *'
+  workflow_dispatch: # Lancement manuel
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install playwright httpx
+          playwright install chromium
+          playwright install-deps chromium
+
+      - name: Restore seen IDs cache
+        uses: actions/cache@v4
+        with:
+          path: seen_ids.json
+          key: leboncoin-seen-${{ github.run_number }}
+          restore-keys: leboncoin-seen-
+
+      - name: Scan LeBonCoin
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SEEN_FILE: seen_ids.json
+        run: python .github/scripts/scan_leboncoin.py
+
+      - name: Upload debug screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-screenshots
+          path: "*.png"
+          retention-days: 3
